@@ -1,0 +1,235 @@
+/* transport_mpi.c
+ *
+ * Параллельное решение уравнения переноса методом MPI.
+ * Реализована схема "Явный левый уголок" (схема 1).
+ *
+ * Метод распараллеливания: ГЕОМЕТРИЧЕСКИЙ ПАРАЛЛЕЛИЗМ (декомпозиция области).
+ * Пространственная область [0, X] разбивается на P равных частей,
+ * каждый MPI-процесс обрабатывает свою часть.
+ * На каждом временном шаге соседние процессы обмениваются граничными значениями.
+ *
+ *   Процесс 0:  [x_0, ..., x_{m1}]
+ *   Процесс 1:  [x_{m1}, ..., x_{m2}]
+ *   ...
+ *   Процесс P-1: [x_{m_{P-1}}, ..., x_M]
+ *
+ * Обмен: каждый процесс отправляет свою левую точку левому соседу
+ *        и принимает от правого соседа его левую точку (для схемы "левый уголок"
+ *        нужна только точка слева, т.е. обмен идёт справа налево).
+ *
+ * Тестовая задача та же: u(t,x) = sin(2*pi*(x - t))
+ *
+ * Компиляция: mpicc -O2 -o transport_mpi transport_mpi.c -lm
+ * Запуск:     mpirun -n 4 ./transport_mpi <M> <K>
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
+#include <mpi.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+#define A_COEFF  1.0
+#define X_MAX    1.0
+#define T_MAX    1.0
+
+double phi(double x)    { return sin(2.0 * M_PI * x); }
+double psi(double t)    { return -sin(2.0 * M_PI * A_COEFF * t); }
+double f_rhs(double t, double x) { return 0.0; }
+double exact_solution(double t, double x) { return sin(2.0 * M_PI * (x - A_COEFF * t)); }
+
+int main(int argc, char *argv[])
+{
+    int rank, size;
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    if (argc < 3) {
+        if (rank == 0) {
+            fprintf(stderr, "Использование: mpirun -n <np> ./transport_mpi <M> <K>\n");
+        }
+        MPI_Finalize();
+        return 1;
+    }
+
+    int M = atoi(argv[1]);  /* Общее число узлов по x */
+    int K = atoi(argv[2]);  /* Число узлов по t */
+
+    double h = X_MAX / M;
+    double tau = T_MAX / K;
+    double sigma = A_COEFF * tau / h;
+
+    if (rank == 0) {
+        printf("=== Параллельное решение уравнения переноса (MPI) ===\n");
+        printf("Схема: Явный левый уголок\n");
+        printf("M = %d, K = %d, h = %e, tau = %e, sigma = %f\n", M, K, h, tau, sigma);
+        printf("Число процессов: %d\n\n", size);
+        if (sigma > 1.0) {
+            printf("ПРЕДУПРЕЖДЕНИЕ: CFL нарушено!\n");
+        }
+    }
+
+    /* ============================================================
+     * Декомпозиция области по пространству.
+     * Каждый процесс обрабатывает непрерывный блок узлов.
+     *
+     * Процесс rank обрабатывает узлы от local_start до local_end (включительно).
+     * Для схемы "левый уголок" нужна одна "теневая" (ghost) точка слева.
+     * ============================================================ */
+
+    /* Равномерное распределение M+1 узлов по size процессам */
+    int total_points = M + 1;
+    int base_count = total_points / size;       /* Базовое число точек на процесс */
+    int remainder = total_points % size;         /* Остаток */
+
+    /* Процессы 0..remainder-1 получают на 1 точку больше */
+    int local_count, local_start;
+    if (rank < remainder) {
+        local_count = base_count + 1;
+        local_start = rank * (base_count + 1);
+    } else {
+        local_count = base_count;
+        local_start = remainder * (base_count + 1) + (rank - remainder) * base_count;
+    }
+    int local_end = local_start + local_count - 1;
+
+    /* Выделяем массивы для локальных данных.
+     * Добавляем 1 ghost-точку слева (если rank > 0). */
+    int has_left_ghost = (rank > 0) ? 1 : 0;
+    int local_size = local_count + has_left_ghost;
+
+    /* Индексация в локальном массиве:
+     *   idx = 0               — ghost-точка (если есть) или первая реальная точка
+     *   idx = has_left_ghost  — первая реальная точка
+     *   idx = local_size - 1  — последняя реальная точка
+     */
+    double *u_curr = (double *)calloc(local_size, sizeof(double));
+    double *u_next = (double *)calloc(local_size, sizeof(double));
+
+    /* Начальное условие */
+    int i;
+    for (i = 0; i < local_count; i++) {
+        int global_m = local_start + i;
+        u_curr[has_left_ghost + i] = phi(global_m * h);
+    }
+
+    /* Определяем соседей */
+    int left_neighbor = (rank > 0) ? rank - 1 : MPI_PROC_NULL;
+    int right_neighbor = (rank < size - 1) ? rank + 1 : MPI_PROC_NULL;
+
+    /* ============================================================
+     * Основной временной цикл
+     * ============================================================ */
+    double start_time = MPI_Wtime();
+
+    int k;
+    MPI_Status status_mpi;
+    for (k = 0; k < K; k++) {
+        double t_k = k * tau;
+
+        /* --- Обмен граничными значениями ---
+         *
+         * Для схемы "левый уголок" точке m нужно значение u_{m-1}^k.
+         * Значит, каждому процессу нужна крайняя правая точка левого соседа.
+         *
+         * Процесс rank отправляет свою ПЕРВУЮ реальную точку ЛЕВОМУ соседу.
+         * Процесс rank принимает от ЛЕВОГО соседа его ПОСЛЕДНЮЮ точку в ghost-ячейку.
+         *
+         * Используем MPI_Sendrecv для избежания deadlock.
+         */
+
+        /* Отправляем первую реальную точку левому соседу,
+         * принимаем ghost-точку от левого соседа */
+        double send_val = u_curr[has_left_ghost];  /* Первая реальная точка */
+        double recv_val = 0.0;
+
+        /* Правый сосед отправляет нам свою первую точку — нам она не нужна для этой схемы.
+         * Нам нужна последняя точка левого соседа.
+         *
+         * Перефразируем: каждый процесс отправляет свою первую реальную точку
+         * левому соседу (тот примет её как ghost справа... нет).
+         *
+         * Для "левого уголка": процессу rank нужна точка u_{local_start - 1}^k,
+         * которая является последней точкой процесса rank-1.
+         *
+         * Значит: rank отправляет свою ПОСЛЕДНЮЮ точку ПРАВОМУ соседу,
+         *         rank принимает от ЛЕВОГО соседа его ПОСЛЕДНЮЮ точку.
+         */
+
+        double send_to_right = u_curr[has_left_ghost + local_count - 1]; /* Последняя реальная */
+
+        MPI_Sendrecv(
+            &send_to_right, 1, MPI_DOUBLE, right_neighbor, 0,  /* Отправляем правому */
+            &recv_val, 1, MPI_DOUBLE, left_neighbor, 0,         /* Принимаем от левого */
+            MPI_COMM_WORLD, &status_mpi
+        );
+
+        /* Записываем полученное значение в ghost-ячейку */
+        if (has_left_ghost) {
+            u_curr[0] = recv_val;
+        }
+
+        /* --- Вычисление следующего временного слоя --- */
+        for (i = 0; i < local_count; i++) {
+            int global_m = local_start + i;
+            int local_idx = has_left_ghost + i;
+
+            if (global_m == 0) {
+                /* Граничное условие слева */
+                u_next[local_idx] = psi((k + 1) * tau);
+            } else {
+                /* Схема "левый уголок":
+                 * u_m^{k+1} = u_m^k - sigma*(u_m^k - u_{m-1}^k) + tau*f */
+                u_next[local_idx] = u_curr[local_idx]
+                    - sigma * (u_curr[local_idx] - u_curr[local_idx - 1])
+                    + tau * f_rhs(t_k, global_m * h);
+            }
+        }
+
+        /* Переключаем слои */
+        double *tmp = u_curr;
+        u_curr = u_next;
+        u_next = tmp;
+    }
+
+    double end_time = MPI_Wtime();
+    double local_time = end_time - start_time;
+
+    /* ============================================================
+     * Вычисление ошибки
+     * ============================================================ */
+    double local_max_err = 0.0;
+    double local_l2_err = 0.0;
+    for (i = 0; i < local_count; i++) {
+        int global_m = local_start + i;
+        double exact = exact_solution(T_MAX, global_m * h);
+        double err = fabs(u_curr[has_left_ghost + i] - exact);
+        if (err > local_max_err) local_max_err = err;
+        local_l2_err += err * err;
+    }
+
+    /* Собираем глобальные ошибки */
+    double global_max_err, global_l2_err, max_time;
+    MPI_Reduce(&local_max_err, &global_max_err, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_l2_err, &global_l2_err, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_time, &max_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        global_l2_err = sqrt(global_l2_err * h);
+        printf("Результаты:\n");
+        printf("  Ошибка (max-норма): %e\n", global_max_err);
+        printf("  Ошибка (L2-норма):  %e\n", global_l2_err);
+        printf("  Время вычисления:   %f сек\n", max_time);
+        printf("  Процессов:          %d\n", size);
+    }
+
+    free(u_curr);
+    free(u_next);
+    MPI_Finalize();
+    return 0;
+}
