@@ -1,7 +1,7 @@
 #!/bin/sh
 #SBATCH -n 16                         # Максимум 16 процессов на кластере
-#SBATCH -o benchmark-%j.out
-#SBATCH -e benchmark-%j.err
+#SBATCH -o benchmarkBIG-%j.out
+#SBATCH -e benchmarkBIG-%j.err
 
 M=10000
 K=10000
@@ -16,3 +16,5 @@ for np in 1 2 4 8 16; do
     mpirun -np $np ./transport_mpi $M $K
     echo ""
 done
+echo "=== Последовательная версия ==="
+./transport_seq 1 $M $K
