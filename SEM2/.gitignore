@@ -1,0 +1,13 @@
+/lab_1/matmul
+/lab_2/loops
+/lab_2/loops_mpi
+/PRPNT/aida64extreme840.exe
+/lab_1/matmul-*.csv
+/lab_1/plots/
+/lab_2/loops-*.csv
+/lab_2/plots/
+/lab_2/results-*/
+*.exe
+*.out
+*.err
+__pycache__/
